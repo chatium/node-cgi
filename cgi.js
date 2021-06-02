@@ -39,6 +39,16 @@ function cgi(cgiBin, options) {
     if (req.uri.pathname.substring(0, options.mountPoint.length) !== options.mountPoint) return next();
     debug('handling HTTP request: %o', req.url);
 
+    var errOut = '';
+    var errorReturned = false;
+    function returnError(err) {
+      if (!errorReturned) {
+        errorReturned = true;
+        err.errOut = errOut;
+        next(err);
+      }
+    }
+
     var host = (req.headers.host || '').split(':');
     var address = host[0];
     var port = host[1];
@@ -107,13 +117,18 @@ function cgi(cgiBin, options) {
     var cgiSpawn = spawn(cgiBin, opts.args, opts);
     debug('cgi spawn (pid: %o)', cgiSpawn.pid);
 
+    cgiSpawn.on('error', returnError);
+
     // The request body is piped to 'stdin' of the CGI spawn
     req.pipe(cgiSpawn.stdin);
 
-    // If `options.stderr` is set to a Stream instance, then re-emit the
-    // 'data' events onto the stream.
-    if (options.stderr) {
-      cgiSpawn.stderr.pipe(options.stderr);
+    if (cgiSpawn.stderr) {
+      cgiSpawn.stderr.on('data', data => (errOut += data));
+      // If `options.stderr` is set to a Stream instance, then re-emit the
+      // 'data' events onto the stream.
+      if (options.stderr) {
+        cgiSpawn.stderr.pipe(options.stderr);
+      }
     }
 
     // A proper CGI script is supposed to print headers to 'stdout'
@@ -122,9 +137,22 @@ function cgi(cgiBin, options) {
     if (!options.nph) {
       cgiResult = new CGIParser(cgiSpawn.stdout);
 
+      // When the parser encounters an error parsing the headers, then
+      // the 'error' event is emitted with an Error instance.
+      var headersHaveError = false;
+      cgiResult.on('error', function(err){
+        headersHaveError = true;
+        returnError(err);
+      });
+
       // When the blank line after the headers has been parsed, then
       // the 'headers' event is emitted with a Headers instance.
       cgiResult.on('headers', function(headers) {
+        // Prevent sending anything if there was an error parsing the headers
+        if (headersHaveError) {
+          return;
+        }
+
         headers.forEach(function(header) {
           // Don't set the 'Status' header. It's special, and should be
           // used to set the HTTP response code below.
@@ -146,6 +174,11 @@ function cgi(cgiBin, options) {
 
     cgiSpawn.on('exit', function(code, signal) {
       debug('cgi spawn %o "exit" event (code %o) (signal %o)', cgiSpawn.pid, code, signal);
+      if (code !== 0) {
+        returnError(
+          new Error('CGI script returned non-zero code ' + code + '.' + (signal ? ' Received signal + ' + signal : ''))
+        );
+      }
       // TODO: react on a failure status code (dump stderr to the response?)
     });
 
